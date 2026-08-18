@@ -1,0 +1,22 @@
+[package]
+name = "agent-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Message-oriented agent transport: single-packet round-trip, 8-level QoS, loss-resilient GRANT/SRPT scheduling — a QUIC-style fast channel for MCP/A2A agent messaging over UDP."
+license = "MIT OR Apache-2.0"
+keywords = ["agent", "transport", "rpc", "mcp", "a2a", "homa"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
+repository = "https://github.com/directwire/agent-transport"
+
+[dependencies]
+socket2 = "0.5"
+
+[profile.release]
+lto = "thin"
+
+# 手写确定性 benchmark（非 criterion）：固定负载、固定 seed、
+# 位级可复现——「第一行代码就是可复现的数字」。
+[[bench]]
+name = "mixed"
+harness = false

@@ -1,0 +1,8 @@
+{
+  "workload_hash": "4587ea4132431b37",
+  "short_p50_us": 814.6,
+  "short_p99_us": 4231.1,
+  "ops_per_sec": 1210.8,
+  "runs": 3,
+  "regression_fraction": 0.01
+}
