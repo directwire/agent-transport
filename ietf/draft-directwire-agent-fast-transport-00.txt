@@ -1,0 +1,448 @@
+
+
+
+
+Network Working Group                                         Directwire
+Internet-Draft                  Directwire (anonymous contributor group)
+Intended status: Informational                            18 August 2026
+Expires: 19 February 2027
+
+
+ Directwire Agent Fast Transport: A Message-Oriented UDP Transport for
+                        MCP/A2A Agent Messaging
+                draft-directwire-agent-fast-transport-00
+
+Abstract
+
+   This document specifies a message-oriented transport for agent
+   messaging, designed as a QUIC-style fast channel for protocols such
+   as Model Context Protocol (MCP) and Agent2Agent (A2A).  Messages are
+   the unit of delivery: a short message (within an unscheduled window)
+   is delivered in a single packet round trip without any grant
+   handshake, while long messages are paced by receiver-driven GRANT
+   scheduling approximating Shortest Remaining Processing Time (SRPT).
+   An eight-level priority queue keeps short interactive requests from
+   being blocked behind bulk transfers, and receiver-driven RESEND/GRANT
+   provides loss resilience.  The transport is implemented as stateless
+   cores with no I/O coupling and no runtime randomness, so behavior and
+   performance are deterministic and reproducible.
+
+   This document is an informational draft describing the protocol as
+   implemented by the reference implementation _agent-transport_ (Rust).
+   It is intentionally transport-framing-only: application semantics
+   such as tool-call routing and authentication are outside its scope.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 19 February 2027.
+
+
+
+
+
+Directwire              Expires 19 February 2027                [Page 1]
+
+Internet-Draft            Agent Fast Transport               August 2026
+
+
+Copyright Notice
+
+   Copyright (c) 2026 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.  Code Components
+   extracted from this document must include Revised BSD License text as
+   described in Section 4.e of the Trust Legal Provisions and are
+   provided without warranty as described in the Revised BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Terminology . . . . . . . . . . . . . . . . . . . . . . . . .   3
+   3.  Transport Model . . . . . . . . . . . . . . . . . . . . . . .   4
+   4.  Packet Format . . . . . . . . . . . . . . . . . . . . . . . .   4
+   5.  Packet Types  . . . . . . . . . . . . . . . . . . . . . . . .   5
+   6.  Priority  . . . . . . . . . . . . . . . . . . . . . . . . . .   6
+   7.  Receiver-Driven Scheduling  . . . . . . . . . . . . . . . . .   6
+   8.  Reliability . . . . . . . . . . . . . . . . . . . . . . . . .   7
+   9.  Determinism and Reproducibility . . . . . . . . . . . . . . .   7
+   10. Security Considerations . . . . . . . . . . . . . . . . . . .   7
+   11. IANA Considerations . . . . . . . . . . . . . . . . . . . . .   8
+   12. Normative References  . . . . . . . . . . . . . . . . . . . .   8
+   13. Informative References  . . . . . . . . . . . . . . . . . . .   8
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .   8
+
+1.  Introduction
+
+   Today's agent messaging — Model Context Protocol (MCP) [MCP] and
+   Agent2Agent (A2A) [A2A] — runs on HTTP, SSE, and WebSocket: byte-
+   stream framing plus per-message header overhead and head-of-line
+   blocking.  When a large artifact transfer shares a connection with
+   short interactive requests, the short requests queue behind the bulk
+   transfer.  This document specifies a transport that treats
+   _messages_, not bytes, as the unit of delivery, and in which the
+   receiver — not the sender — drives scheduling.  It is designed for
+   the request pattern that dominates agent workloads: many small round
+   trips with occasional large transfers (context snapshots, tool
+   outputs, media artifacts).
+
+
+
+
+
+
+
+Directwire              Expires 19 February 2027                [Page 2]
+
+Internet-Draft            Agent Fast Transport               August 2026
+
+
+   The design is a Homa-style receiver-driven approach [HOMA] realized
+   on plain UDP datagrams, without data-center network-priority
+   machinery: eight sender-side priority classes carry the QoS, and the
+   receiver grants transmission credits per message.  The transport has
+   four design goals:
+
+   *  *Single-packet round trips.* A message no larger than the
+      unscheduled window is delivered in one round trip; no setup, no
+      handshake, no frame parsing.
+
+   *  *Short traffic is never starved.* Receiver-driven SRPT scheduling
+      and sender-side priority queues keep interactive requests ahead of
+      bulk transfers.
+
+   *  *Loss resilience.* Receiver-driven RESEND requests and GRANT
+      retransmission repair loss without sender-side congestion control
+      stalls.
+
+   *  *Determinism.* The core is pure state machines with no I/O
+      coupling and no randomness, so tests and benchmarks are bit-
+      reproducible.
+
+   Current IETF agent-transport efforts build on Media Over QUIC (MOQ)
+   and are sender-driven [MOQ]; the receiver-driven scheduling specified
+   here is the complementary design point, and the reference
+   implementation's benchmark provides a head-to-head comparison basis.
+
+   The wire format is specified in Section 3.  The reference
+   implementation and a reproducible benchmark are published at
+   https://github.com/directwire/agent-transport.
+
+2.  Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+   "OPTIONAL" in this document are to be interpreted as described in BCP
+   14 [RFC2119] when, and only when, they appear in all capitals, as
+   shown here.
+
+   Message  The unit of application delivery: an ordered byte sequence
+      identified by a sender-assigned 64-bit message ID.
+
+   Chunk  A fixed-size fragment of a message carried in one DATA packet.
+
+   Grant  A receiver-issued cumulative permission to send bytes up to a
+      given offset.
+
+   Unscheduled window  The leading bytes of a message that are sent
+
+
+
+Directwire              Expires 19 February 2027                [Page 3]
+
+Internet-Draft            Agent Fast Transport               August 2026
+
+
+      without waiting for a grant.
+
+   Head-of-line blocking  Delay of one message behind unrelated bytes of
+      another message sharing the same byte stream.
+
+3.  Transport Model
+
+   The transport carries UDP datagrams between two endpoints over a
+   single socket.  A message is split into chunks of at most _packet
+   size_ bytes (22-byte header plus payload).  A short message fits in
+   the unscheduled window and its first chunk is sent immediately; the
+   receiver delivers the message as soon as all chunks arrive, without
+   any grant exchange.  A longer message sends only its unscheduled
+   window initially; subsequent chunks are transmitted only after the
+   receiver grants the corresponding cumulative offset.
+
+   Any number of messages may be in flight concurrently over one socket,
+   multiplexed by message ID.  The transport is at-least-once: an RPC
+   layer re-sends an entire request (same message ID) on timeout, and
+   receivers deduplicate completed message IDs.  Application handlers
+   MUST therefore be idempotent, or perform exactly-once enforcement at
+   the application layer based on message ID.
+
+4.  Packet Format
+
+   Every packet is a UDP datagram whose first 22 bytes are a fixed
+   little-endian header (no alignment padding), optionally followed by a
+   payload for DATA packets.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Directwire              Expires 19 February 2027                [Page 4]
+
+Internet-Draft            Agent Fast Transport               August 2026
+
+
+        +========+========+==========+===========================+
+        | Offset | Length | Field    | Meaning                   |
+        +========+========+==========+===========================+
+        | 0      | 1      | Type     | Packet type (Section 4)   |
+        +--------+--------+----------+---------------------------+
+        | 1      | 1      | Priority | 8-level dynamic priority, |
+        |        |        |          | 0 highest (DATA only)     |
+        +--------+--------+----------+---------------------------+
+        | 2      | 8      | Message  | Sender-assigned, unique   |
+        |        |        | ID       | within the message        |
+        +--------+--------+----------+---------------------------+
+        | 10     | 4      | Message  | DATA: total message       |
+        |        |        | Length   | length; control: 0        |
+        +--------+--------+----------+---------------------------+
+        | 14     | 4      | Offset   | Per-type (Section 4)      |
+        +--------+--------+----------+---------------------------+
+        | 18     | 4      | Length   | Per-type (Section 4)      |
+        +--------+--------+----------+---------------------------+
+
+             Table 1: Header layout (22 bytes, little-endian)
+
+   For DATA packets the payload length MUST equal the Length field; a
+   receiver MUST discard a datagram whose payload length mismatches.  A
+   receiver MUST discard a packet whose Type is unknown.
+
+5.  Packet Types
+
+   DATA (0)  Carries the message chunk in [Offset, Offset+Length).
+      Message Length is the total message size.  The receiver writes the
+      chunk into a reassembly bitmap and delivers the message when the
+      bitmap is complete.
+
+   GRANT (1)  Receiver-to-sender: grants transmission of bytes up to
+      Offset (cumulative).  Length is the newly granted span.  The
+      sender transmits any chunks in the newly unlocked range.
+
+   RESEND (2)  Receiver-to-sender: requests retransmission of [Offset,
+      Offset+Length), covering all missing chunks in the granted window
+      in one request (batch repair of burst loss).
+
+   BUSY (3)  Receiver-to-sender: concurrency limit reached; the sender
+      SHOULD pause and probe again later.  No payload fields are used.
+
+
+
+
+
+
+
+
+
+Directwire              Expires 19 February 2027                [Page 5]
+
+Internet-Draft            Agent Fast Transport               August 2026
+
+
+6.  Priority
+
+   The sender classifies DATA packets into one of eight priority queues
+   derived from the message length.  Control packets (GRANT, RESEND,
+   BUSY) are small and influence scheduling liveness, so they are sent
+   directly without queueing.
+
+                       +==========+================+
+                       | Priority | Message length |
+                       +==========+================+
+                       | 0        | <= 100 B       |
+                       +----------+----------------+
+                       | 1        | <= 1 KB        |
+                       +----------+----------------+
+                       | 2        | <= 10 KB       |
+                       +----------+----------------+
+                       | 3        | <= 100 KB      |
+                       +----------+----------------+
+                       | 4        | <= 1 MB        |
+                       +----------+----------------+
+                       | 5        | <= 10 MB       |
+                       +----------+----------------+
+                       | 6        | <= 100 MB      |
+                       +----------+----------------+
+                       | 7        | > 100 MB       |
+                       +----------+----------------+
+
+                             Table 2: Length to
+                              priority mapping
+
+   The queue drains highest priority first (FIFO within a class), so a
+   burst of low-priority chunks from a long message does not block a
+   short, high-priority request.
+
+7.  Receiver-Driven Scheduling
+
+   The receiver drives transmission credits.  The sender may send the
+   unscheduled window immediately; beyond it, chunks wait for a GRANT.
+
+   Periodically, the receiver recomputes its grant set.  It ranks
+   incomplete messages by remaining bytes (Shortest Remaining Processing
+   Time) and grants the first K (the overcommit parameter, default 2),
+   approximating Homa's over-commitment so that a single grant does not
+   starve other messages.  A newly arriving short message preempts a
+   longer message's grant cadence; because grants are cumulative, the
+   displaced message retains its already-granted quota.  Messages
+   waiting longer than a starvation threshold MUST be admitted to the
+   grant set, guaranteeing progress.
+
+
+
+Directwire              Expires 19 February 2027                [Page 6]
+
+Internet-Draft            Agent Fast Transport               August 2026
+
+
+   Loss recovery is also receiver-driven.  A chunk missing from the
+   granted window for longer than the resend timeout triggers one RESEND
+   covering the whole missing span.  If a grant produces no progress
+   within the grant timeout, the receiver re-issues the GRANT (the
+   original may have been lost).  If a sender is idle past the poke
+   timeout, it re-sends its last chunk as a probe, prompting the
+   receiver to issue RESEND or GRANT.
+
+   After a sender transmits the final chunk it retains the message state
+   for a short linger period so that a late RESEND for the tail can
+   still be answered; without this, the peer could wait forever for a
+   packet the sender already discarded.
+
+8.  Reliability
+
+   Delivery semantics are at-least-once.  The RPC layer assigns a
+   message ID once and re-sends the entire request on timeout with the
+   same ID.  The receiver keeps a bounded cache of recently delivered
+   message IDs and drops duplicate DATA for them, and while a request is
+   being computed it drops duplicate requests for the same ID, so an
+   application handler runs at most once per message ID.  Applications
+   requiring exactly-once effects MUST deduplicate or drive state
+   machines on message ID themselves.
+
+   A message whose resends go unanswered beyond a bound (default 40) is
+   considered abandoned; the receiver removes it from the grant set so a
+   dead sender cannot wedge the scheduler.
+
+9.  Determinism and Reproducibility
+
+   The sender and receiver cores are pure state machines: they take
+   packets and a clock as input and produce actions as output, with no
+   I/O coupling and no runtime randomness.  Tests exercise scheduling,
+   reassembly, and retransmission as deterministic state-machine
+   transitions.  The reference implementation ships a fixed-workload
+   benchmark (fixed operation count, fixed payload sizes, zero
+   randomness) whose workload constants are protected by a fingerprint,
+   so any machine re-running the published baseline produces the same
+   workload and comparable numbers.  This is what makes performance
+   claims auditable rather than asserted.
+
+10.  Security Considerations
+
+   This document defines a transport framing; it does not provide
+   authentication, confidentiality, or integrity.  Operators MUST deploy
+   it over a secured channel or a securing layer: DTLS for datagrams, or
+   an application-layer authentication and authorization envelope (as
+   used by the MCP and A2A application layers).
+
+
+
+Directwire              Expires 19 February 2027                [Page 7]
+
+Internet-Draft            Agent Fast Transport               August 2026
+
+
+   The transport is vulnerable to spoofing of GRANT, RESEND, and DATA
+   packets from an on-path or off-path attacker who knows the socket
+   pair.  A GRANT inflates the sender's transmission window; a RESEND
+   causes retransmission.  These effects are bounded (a grant never
+   exceeds message length; a resend only retransmits already-owned
+   data), but the transport does not resist traffic amplification or
+   message forgery.  Receivers SHOULD rate-limit per-source packet
+   processing and SHOULD validate the origin before acting on control
+   packets.
+
+11.  IANA Considerations
+
+   This document has no IANA actions.
+
+12.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997,
+              <https://www.rfc-editor.org/info/rfc2119>.
+
+13.  Informative References
+
+   [HOMA]     Montazeri, B., Li, Y., Alizadeh, M., and J. Ousterhout,
+              "Homa: A Receiver-Driven Low-Latency Transport Protocol
+              Using Network Priorities", ACM SIGCOMM 2018, August 2018,
+              <https://homa-transport.org>.
+
+   [MCP]      MCP Project, "Model Context Protocol", 2025,
+              <https://modelcontextprotocol.io>.
+
+   [A2A]      A2A Project, "Agent2Agent (A2A) Protocol", 2025,
+              <https://a2a-protocol.org>.
+
+   [MOQ]      Nandakumar, S. and C. Jennings, "MOQ Transport for Agent
+              Protocols", February 2026,
+              <https://datatracker.ietf.org/doc/draft-nandakumar-ai-
+              agent-moq-transport-00/>.
+
+Author's Address
+
+   Directwire
+   Directwire (anonymous contributor group)
+   Email: draft-directwire@directwire.example
+
+
+
+
+
+
+
+
+Directwire              Expires 19 February 2027                [Page 8]

@@ -1,0 +1,13 @@
+* text=auto
+
+# Build/CI-critical scripts and committed generated artifacts must stay LF
+# across platforms, or the "artifacts are current" gate in CI (which
+# regenerates .txt/.html and diffs) becomes line-ending-fragile.
+*.sh eol=lf
+*.py eol=lf
+*.rs eol=lf
+*.toml eol=lf
+*.md eol=lf
+*.xml eol=lf
+*.txt eol=lf
+*.html eol=lf

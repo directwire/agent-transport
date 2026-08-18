@@ -1,0 +1,53 @@
+name: ietf-draft
+
+# Build the Directwire agent-fast-transport Internet-Draft
+# (.xml -> .txt/.html) and run idnits preflight checks. Pure-python toolchain
+# (xml2rfc); no ruby needed. Triggered on any change under ietf/, plus on-demand.
+
+on:
+  push:
+    paths:
+      - 'ietf/**'
+      - '.github/workflows/ietf-draft.yml'
+  pull_request:
+    paths:
+      - 'ietf/**'
+      - '.github/workflows/ietf-draft.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build draft (txt + html)
+        run: ./ietf/build.sh
+
+      - name: Verify generated artifacts are current
+        run: |
+          git diff --exit-code -- ietf/ || { echo "::: ietf/ artifacts out of date — run ./ietf/build.sh and commit the regenerated .txt/.html"; exit 1; }
+
+      - name: idnits preflight (advisory)
+        run: |
+          curl -fsSL -o /tmp/idnits \
+            https://raw.githubusercontent.com/ietf-tools/idnits/main/idnits \
+            || { echo "::: could not download idnits (advisory — skipping)"; exit 0; }
+          bash /tmp/idnits ietf/draft-directwire-agent-fast-transport-00.txt \
+            || echo "::: idnits reported issues (see above) — advisory, not blocking"
+
+      - name: Upload draft artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-directwire-agent-fast-transport
+          path: |
+            ietf/draft-directwire-agent-fast-transport-00.xml
+            ietf/draft-directwire-agent-fast-transport-00.txt
+            ietf/draft-directwire-agent-fast-transport-00.html
+          if-no-files-found: error

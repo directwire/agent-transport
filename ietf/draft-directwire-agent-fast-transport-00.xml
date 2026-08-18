@@ -1,0 +1,329 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="rfc2629.xslt" ?>
+<rfc version="3" ipr="trust200902" submissionType="IETF" category="info"
+     docName="draft-directwire-agent-fast-transport-00"
+     xml:lang="en" consensus="false">
+  <front>
+    <title abbrev="Agent Fast Transport">Directwire Agent Fast Transport: A Message-Oriented UDP Transport for MCP/A2A Agent Messaging</title>
+    <seriesInfo name="Internet-Draft" value="draft-directwire-agent-fast-transport-00"/>
+    <author fullname="Directwire">
+      <organization>Directwire (anonymous contributor group)</organization>
+      <address>
+        <email>draft-directwire@directwire.example</email>
+      </address>
+    </author>
+    <date year="2026" month="August" day="18"/>
+    <area>Transport</area>
+    <abstract>
+      <t>This document specifies a message-oriented transport for agent
+      messaging, designed as a QUIC-style fast channel for protocols such as
+      Model Context Protocol (MCP) and Agent2Agent (A2A). Messages are the unit
+      of delivery: a short message (within an unscheduled window) is delivered
+      in a single packet round trip without any grant handshake, while long
+      messages are paced by receiver-driven GRANT scheduling approximating
+      Shortest Remaining Processing Time (SRPT). An eight-level priority queue
+      keeps short interactive requests from being blocked behind bulk
+      transfers, and receiver-driven RESEND/GRANT provides loss resilience.
+      The transport is implemented as stateless cores with no I/O coupling and
+      no runtime randomness, so behavior and performance are deterministic and
+      reproducible.</t>
+      <t>This document is an informational draft describing the protocol as
+      implemented by the reference implementation <em>agent-transport</em>
+      (Rust). It is intentionally transport-framing-only: application
+      semantics such as tool-call routing and authentication are outside its
+      scope.</t>
+    </abstract>
+  </front>
+
+  <middle>
+    <section anchor="introduction" numbered="true" toc="default">
+      <name>Introduction</name>
+      <t>Today's agent messaging — Model Context Protocol (MCP)
+      <xref target="MCP"/> and Agent2Agent (A2A) <xref target="A2A"/> — runs
+      on HTTP, SSE, and WebSocket: byte-stream framing plus per-message header
+      overhead and head-of-line blocking. When a large artifact transfer shares
+      a connection with short interactive requests, the short requests queue
+      behind the bulk transfer.
+      This document specifies a transport that treats <em>messages</em>, not
+      bytes, as the unit of delivery, and in which the receiver — not the
+      sender — drives scheduling. It is designed for the request pattern that
+      dominates agent workloads: many small round trips with occasional large
+      transfers (context snapshots, tool outputs, media artifacts).</t>
+      <t>The design is a Homa-style receiver-driven approach
+      <xref target="HOMA"/> realized on plain UDP datagrams, without
+      data-center network-priority machinery:
+      eight sender-side priority classes carry the QoS, and the receiver grants
+      transmission credits per message. The transport has four design goals:</t>
+      <ul spacing="normal">
+        <li><t><strong>Single-packet round trips.</strong> A message no larger
+        than the unscheduled window is delivered in one round trip; no setup,
+        no handshake, no frame parsing.</t></li>
+        <li><t><strong>Short traffic is never starved.</strong> Receiver-driven
+        SRPT scheduling and sender-side priority queues keep interactive
+        requests ahead of bulk transfers.</t></li>
+        <li><t><strong>Loss resilience.</strong> Receiver-driven RESEND requests
+        and GRANT retransmission repair loss without sender-side congestion
+        control stalls.</t></li>
+        <li><t><strong>Determinism.</strong> The core is pure state machines
+        with no I/O coupling and no randomness, so tests and benchmarks are
+        bit-reproducible.</t></li>
+      </ul>
+      <t>Current IETF agent-transport efforts build on Media Over QUIC (MOQ)
+      and are sender-driven <xref target="MOQ"/>; the receiver-driven
+      scheduling specified here is the complementary design point, and the
+      reference implementation's benchmark provides a head-to-head comparison
+      basis.</t>
+      <t>The wire format is specified in Section 3. The reference
+      implementation and a reproducible benchmark are published at
+      <eref target="https://github.com/directwire/agent-transport"/>.</t>
+    </section>
+
+    <section anchor="terminology" numbered="true" toc="default">
+      <name>Terminology</name>
+      <t>The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+      "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+      "OPTIONAL" in this document are to be interpreted as described in BCP 14
+      <xref target="RFC2119"/> when, and only when, they appear in all
+      capitals, as shown here.</t>
+      <dl spacing="normal">
+        <dt>Message</dt>
+        <dd>The unit of application delivery: an ordered byte sequence
+        identified by a sender-assigned 64-bit message ID.</dd>
+        <dt>Chunk</dt>
+        <dd>A fixed-size fragment of a message carried in one DATA packet.</dd>
+        <dt>Grant</dt>
+        <dd>A receiver-issued cumulative permission to send bytes up to a given
+        offset.</dd>
+        <dt>Unscheduled window</dt>
+        <dd>The leading bytes of a message that are sent without waiting for a
+        grant.</dd>
+        <dt>Head-of-line blocking</dt>
+        <dd>Delay of one message behind unrelated bytes of another message
+        sharing the same byte stream.</dd>
+      </dl>
+    </section>
+
+    <section anchor="transport-model" numbered="true" toc="default">
+      <name>Transport Model</name>
+      <t>The transport carries UDP datagrams between two endpoints over a single
+      socket. A message is split into chunks of at most <em>packet size</em>
+      bytes (22-byte header plus payload). A short message fits in the
+      unscheduled window and its first chunk is sent immediately; the receiver
+      delivers the message as soon as all chunks arrive, without any grant
+      exchange. A longer message sends only its unscheduled window initially;
+      subsequent chunks are transmitted only after the receiver grants the
+      corresponding cumulative offset.</t>
+      <t>Any number of messages may be in flight concurrently over one socket,
+      multiplexed by message ID. The transport is at-least-once: an RPC layer
+      re-sends an entire request (same message ID) on timeout, and receivers
+      deduplicate completed message IDs. Application handlers MUST therefore be
+      idempotent, or perform exactly-once enforcement at the application layer
+      based on message ID.</t>
+    </section>
+
+    <section anchor="packet-format" numbered="true" toc="default">
+      <name>Packet Format</name>
+      <t>Every packet is a UDP datagram whose first 22 bytes are a fixed
+      little-endian header (no alignment padding), optionally followed by a
+      payload for DATA packets.</t>
+      <table anchor="header-layout">
+        <name>Header layout (22 bytes, little-endian)</name>
+        <thead>
+          <tr>
+            <th>Offset</th>
+            <th>Length</th>
+            <th>Field</th>
+            <th>Meaning</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>0</td><td>1</td><td>Type</td><td>Packet type (Section 4)</td></tr>
+          <tr><td>1</td><td>1</td><td>Priority</td><td>8-level dynamic priority, 0 highest (DATA only)</td></tr>
+          <tr><td>2</td><td>8</td><td>Message ID</td><td>Sender-assigned, unique within the message</td></tr>
+          <tr><td>10</td><td>4</td><td>Message Length</td><td>DATA: total message length; control: 0</td></tr>
+          <tr><td>14</td><td>4</td><td>Offset</td><td>Per-type (Section 4)</td></tr>
+          <tr><td>18</td><td>4</td><td>Length</td><td>Per-type (Section 4)</td></tr>
+        </tbody>
+      </table>
+      <t>For DATA packets the payload length MUST equal the Length field; a
+      receiver MUST discard a datagram whose payload length mismatches. A
+      receiver MUST discard a packet whose Type is unknown.</t>
+    </section>
+
+    <section anchor="packet-types" numbered="true" toc="default">
+      <name>Packet Types</name>
+      <dl spacing="normal">
+        <dt>DATA (0)</dt>
+        <dd>Carries the message chunk in [Offset, Offset+Length). Message
+        Length is the total message size. The receiver writes the chunk into a
+        reassembly bitmap and delivers the message when the bitmap is
+        complete.</dd>
+        <dt>GRANT (1)</dt>
+        <dd>Receiver-to-sender: grants transmission of bytes up to Offset
+        (cumulative). Length is the newly granted span. The sender transmits
+        any chunks in the newly unlocked range.</dd>
+        <dt>RESEND (2)</dt>
+        <dd>Receiver-to-sender: requests retransmission of [Offset,
+        Offset+Length), covering all missing chunks in the granted window in
+        one request (batch repair of burst loss).</dd>
+        <dt>BUSY (3)</dt>
+        <dd>Receiver-to-sender: concurrency limit reached; the sender SHOULD
+        pause and probe again later. No payload fields are used.</dd>
+      </dl>
+    </section>
+
+    <section anchor="priority" numbered="true" toc="default">
+      <name>Priority</name>
+      <t>The sender classifies DATA packets into one of eight priority queues
+      derived from the message length. Control packets (GRANT, RESEND, BUSY)
+      are small and influence scheduling liveness, so they are sent directly
+      without queueing.</t>
+      <table anchor="priority-map">
+        <name>Length to priority mapping</name>
+        <thead>
+          <tr><th>Priority</th><th>Message length</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0</td><td>&lt;= 100 B</td></tr>
+          <tr><td>1</td><td>&lt;= 1 KB</td></tr>
+          <tr><td>2</td><td>&lt;= 10 KB</td></tr>
+          <tr><td>3</td><td>&lt;= 100 KB</td></tr>
+          <tr><td>4</td><td>&lt;= 1 MB</td></tr>
+          <tr><td>5</td><td>&lt;= 10 MB</td></tr>
+          <tr><td>6</td><td>&lt;= 100 MB</td></tr>
+          <tr><td>7</td><td>&gt; 100 MB</td></tr>
+        </tbody>
+      </table>
+      <t>The queue drains highest priority first (FIFO within a class), so a
+      burst of low-priority chunks from a long message does not block a
+      short, high-priority request.</t>
+    </section>
+
+    <section anchor="scheduling" numbered="true" toc="default">
+      <name>Receiver-Driven Scheduling</name>
+      <t>The receiver drives transmission credits. The sender may send the
+      unscheduled window immediately; beyond it, chunks wait for a GRANT.</t>
+      <t>Periodically, the receiver recomputes its grant set. It ranks
+      incomplete messages by remaining bytes (Shortest Remaining Processing
+      Time) and grants the first K (the overcommit parameter, default 2),
+      approximating Homa's over-commitment so that a single grant does not
+      starve other messages. A newly arriving short message preempts a longer
+      message's grant cadence; because grants are cumulative, the displaced
+      message retains its already-granted quota. Messages waiting longer than a
+      starvation threshold MUST be admitted to the grant set, guaranteeing
+      progress.</t>
+      <t>Loss recovery is also receiver-driven. A chunk missing from the
+      granted window for longer than the resend timeout triggers one RESEND
+      covering the whole missing span. If a grant produces no progress within
+      the grant timeout, the receiver re-issues the GRANT (the original may
+      have been lost). If a sender is idle past the poke timeout, it re-sends
+      its last chunk as a probe, prompting the receiver to issue RESEND or
+      GRANT.</t>
+      <t>After a sender transmits the final chunk it retains the message state
+      for a short linger period so that a late RESEND for the tail can still be
+      answered; without this, the peer could wait forever for a packet the
+      sender already discarded.</t>
+    </section>
+
+    <section anchor="reliability" numbered="true" toc="default">
+      <name>Reliability</name>
+      <t>Delivery semantics are at-least-once. The RPC layer assigns a message
+      ID once and re-sends the entire request on timeout with the same ID. The
+      receiver keeps a bounded cache of recently delivered message IDs and
+      drops duplicate DATA for them, and while a request is being computed it
+      drops duplicate requests for the same ID, so an application handler runs
+      at most once per message ID. Applications requiring exactly-once effects
+      MUST deduplicate or drive state machines on message ID themselves.</t>
+      <t>A message whose resends go unanswered beyond a bound (default 40) is
+      considered abandoned; the receiver removes it from the grant set so a
+      dead sender cannot wedge the scheduler.</t>
+    </section>
+
+    <section anchor="determinism" numbered="true" toc="default">
+      <name>Determinism and Reproducibility</name>
+      <t>The sender and receiver cores are pure state machines: they take
+      packets and a clock as input and produce actions as output, with no I/O
+      coupling and no runtime randomness. Tests exercise scheduling,
+      reassembly, and retransmission as deterministic state-machine
+      transitions. The reference implementation ships a fixed-workload
+      benchmark (fixed operation count, fixed payload sizes, zero
+      randomness) whose workload constants are protected by a fingerprint, so
+      any machine re-running the published baseline produces the same
+      workload and comparable numbers. This is what makes performance claims
+      auditable rather than asserted.</t>
+    </section>
+
+    <section anchor="security" numbered="true" toc="default">
+      <name>Security Considerations</name>
+      <t>This document defines a transport framing; it does not provide
+      authentication, confidentiality, or integrity. Operators MUST deploy it
+      over a secured channel or a securing layer: DTLS for datagrams, or an
+      application-layer authentication and authorization envelope (as used by
+      the MCP and A2A application layers).</t>
+      <t>The transport is vulnerable to spoofing of GRANT, RESEND, and DATA
+      packets from an on-path or off-path attacker who knows the socket pair.
+      A GRANT inflates the sender's transmission window; a RESEND causes
+      retransmission. These effects are bounded (a grant never exceeds message
+      length; a resend only retransmits already-owned data), but the transport
+      does not resist traffic amplification or message forgery. Receivers
+      SHOULD rate-limit per-source packet processing and SHOULD validate the
+      origin before acting on control packets.</t>
+    </section>
+
+    <section anchor="iana" numbered="true" toc="default">
+      <name>IANA Considerations</name>
+      <t>This document has no IANA actions.</t>
+    </section>
+  </middle>
+
+  <back>
+    <references>
+      <name>Normative References</name>
+      <reference anchor="RFC2119" target="https://www.rfc-editor.org/info/rfc2119">
+        <front>
+          <title>Key words for use in RFCs to Indicate Requirement Levels</title>
+          <author fullname="S. Bradner"/>
+          <date year="1997" month="March"/>
+        </front>
+        <seriesInfo name="BCP" value="14"/>
+        <seriesInfo name="RFC" value="2119"/>
+      </reference>
+    </references>
+    <references>
+      <name>Informative References</name>
+      <reference anchor="HOMA" target="https://homa-transport.org">
+        <front>
+          <title>Homa: A Receiver-Driven Low-Latency Transport Protocol Using Network Priorities</title>
+          <author fullname="Behnam Montazeri"><organization>Stanford University</organization></author>
+          <author fullname="Yilong Li"><organization>Stanford University</organization></author>
+          <author fullname="Mohammad Alizadeh"><organization>Stanford University</organization></author>
+          <author fullname="John Ousterhout"><organization>Stanford University</organization></author>
+          <date year="2018" month="August"/>
+        </front>
+        <seriesInfo name="ACM SIGCOMM" value="2018"/>
+      </reference>
+      <reference anchor="MCP" target="https://modelcontextprotocol.io">
+        <front>
+          <title>Model Context Protocol</title>
+          <author><organization>MCP Project</organization></author>
+          <date year="2025"/>
+        </front>
+      </reference>
+      <reference anchor="A2A" target="https://a2a-protocol.org">
+        <front>
+          <title>Agent2Agent (A2A) Protocol</title>
+          <author><organization>A2A Project</organization></author>
+          <date year="2025"/>
+        </front>
+      </reference>
+      <reference anchor="MOQ" target="https://datatracker.ietf.org/doc/draft-nandakumar-ai-agent-moq-transport-00/">
+        <front>
+          <title>MOQ Transport for Agent Protocols</title>
+          <author fullname="Suhas Nandakumar"><organization>Cisco</organization></author>
+          <author fullname="Cullen Jennings"><organization>Cisco</organization></author>
+          <date year="2026" month="February"/>
+        </front>
+      </reference>
+    </references>
+  </back>
+</rfc>
